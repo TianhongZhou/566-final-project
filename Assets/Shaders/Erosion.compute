@@ -8,11 +8,163 @@
 #pragma kernel Retargeting
 #pragma kernel Breaching
 
+//Uniforms
+uniform float _CellSize = 1.0;
+uniform uint _Width;
+uniform uint _Height;
+
+//Deposition parameters
+uniform float _DepositionStrength = 1.0;
+uniform float _RainIntensity = 2.6;
+
 // Create a RenderTexture with enableRandomWrite flag and set it
 // with cs.SetTexture
 Texture2D<float> _InHeightTex;
 Texture2D<float> _InHeightRT;
 RWTexture2D<float> _OutHeightRT;
+RWTexture2D<float> _StreamRT;
+RWTexture2D<float> _TempRT;
+RWTexture2D<float> _SedimentRT;
+
+//Constants
+static const int2 next8[8] =
+{
+    int2(0, 1), int2(1, 1), int2(1, 0), int2(1, -1),
+    int2(0, -1), int2(-1, -1), int2(-1, 0), int2(-1, 1)
+};
+
+//Eroion
+uniform float _FlowP = 1.3;
+uniform float _ErosionK = 0.0005;
+uniform float _ErosionPSA = 0.8;
+uniform float _ErosionPSL = 2.0;
+uniform float _ErosionDT = 1.0;
+uniform float _MaxStreamPower = 10000.0;
+
+// Thermal
+uniform float _Talus = 30.0;
+uniform float _ThermalDT = 1.0;
+
+static const float orthoDist = 1.0;
+static const float diagonalDist = 1.4142;
+
+//Utility
+
+float GetSediment(int2 p)
+{
+    if (!IsInBounds(p))
+        return 0.0;
+    return _SedimentRT[p];
+}
+
+bool IsInBounds(int2 p)
+{
+    return p.x >= 0 && p.x < (int) _Width && p.y >= 0 && p.y < (int) _Height;
+}
+
+int2 GetClampedCoord(int2 p)
+{
+    p.x = clamp(p.x, 0, (int) _Width - 1);
+    p.y = clamp(p.y, 0, (int) _Height - 1);
+    return p;
+}
+
+float GetDistance(int2 a, int2 b)
+{
+    int2 delta = a - b;
+    if (delta.x == 0 || delta.y == 0)
+        return orthoDist;
+    return diagonalDist;
+}
+
+float GetHeight(int2 p)
+{
+    p = GetClampedCoord(p);
+    return _InHeightRT[p];
+}
+
+float GetStream(int2 p)
+{
+    if (!IsInBounds(p))
+        return 0.0;
+    return _StreamRT[p];
+}
+
+float GetSlope(int2 p, int2 q)
+{
+    if (!IsInBounds(p) || !IsInBounds(q))
+        return 0.0;
+    if (p.x == q.x && p.y == q.y)
+        return 0.0;
+    
+    float dh = GetHeight(q) - GetHeight(p);
+    float dist = GetDistance(p, q);
+    return dh / dist;
+}
+
+void GetFlowWeights(int2 p, out float weights[8])
+{
+    float slopeSum = 0.0;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        float slope = GetSlope(p + next8[i], p);
+        if (slope > 0.0)
+        {
+            weights[i] = pow(abs(slope), _FlowP);
+            slopeSum += weights[i];
+        }
+        else
+        {
+            weights[i] = 0.0;
+        }
+    }
+    
+    slopeSum = (slopeSum < 0.00001) ? 1.0 : slopeSum;
+    for (int i = 0; i < 8; i++)
+        weights[i] /= slopeSum;
+}
+
+float ComputeIncomingFlow(int2 p)
+{
+    float totalFlow = 0.0;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 q = p + next8[i];
+        if (!IsInBounds(q))
+            continue;
+        
+        float weights[8];
+        GetFlowWeights(q, weights);
+        
+        int oppositeDir = (i + 4) % 8;
+        if (weights[oppositeDir] > 0.0)
+        {
+            totalFlow += weights[oppositeDir] * GetStream(q);
+        }
+    }
+    
+    return totalFlow;
+}
+
+int2 GetSteepestNeighbor(int2 p)
+{
+    int2 steepest = int2(0, 0);
+    float maxSlope = 0.0;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 neighbor = p + next8[i];
+        float slope = GetSlope(neighbor, p);
+        if (slope > maxSlope)
+        {
+            maxSlope = slope;
+            steepest = next8[i];
+        }
+    }
+    return steepest;
+}
 
 [numthreads(8, 8, 1)]
 void CopyFromTexture(uint3 id : SV_DispatchThreadID)
@@ -86,35 +238,197 @@ void Upsample2x(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void FlowRouting(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
     
+    float cellArea = _CellSize * _CellSize;
+    float stream = cellArea * _RainIntensity;
+    
+    stream += ComputeIncomingFlow(pos);
+    
+    _StreamRT[pos] = stream;
 }
 
 [numthreads(8, 8, 1)]
 void ErosionStep(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
+    
+    float currentHeight = GetHeight(pos);
+    float stream = GetStream(pos);
+    
+    int2 dir = GetSteepestNeighbor(pos);
+    int2 receiver = pos + dir;
+    
+    if (!IsInBounds(receiver))
+        return;
+    
+    float receiverHeight = GetHeight(receiver);
+    float steepestSlope = GetSlope(receiver, pos);
+    
+    if (steepestSlope <= 0.0)
+        return;
+    
+    float streamPower = pow(stream, _ErosionPSA) * pow(steepestSlope, _ErosionPSL);
+    streamPower = clamp(streamPower, 0.0, _MaxStreamPower);
+    streamPower *= _ErosionK;
+    
+    float newHeight = currentHeight - _ErosionDT * streamPower;
+    newHeight = max(newHeight, receiverHeight);
+    
+    _OutHeightRT[pos] = newHeight;
     
 }
 
 [numthreads(8, 8, 1)]
 void ThermalStep(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
+    
+    float talus_rad = radians(_Talus);
+    float tan_talus = tan(talus_rad);
+    
+    float height = GetHeight(pos);
+    float totalChange = 0.0;
+    int activeCount = 0;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 neighbor = pos + next8[i];
+        if (!IsInBounds(neighbor))
+            continue;
+        
+        float neighborHeight = GetHeight(neighbor);
+        float slope = GetSlope(neighbor, pos);
+        
+        if (slope > tan_talus)
+        {
+            float dist = GetDistance(pos, neighbor);
+            float targetHeight = neighborHeight + tan_talus * dist;
+            totalChange += (targetHeight - height);
+            activeCount++;
+        }
+    }
+    
+    if (activeCount > 0)
+    {
+        float avgChange = totalChange / (float) activeCount;
+        height += _ThermalDT * avgChange * 0.1;
+    }
+    
+    _TempRT[pos] = height;
     
 }
 
 [numthreads(8, 8, 1)]
 void DepositStep(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
     
+    float height = GetHeight(pos);
+    float stream = GetStream(pos);
+    float sediment = GetSediment(pos);
+    
+    float incomingSediment = 0.0;
+    for (int i = 0; i < 8; i++)
+    {
+        int2 q = pos + next8[i];
+        if (!IsInBounds(q))
+            continue;
+        
+        float weights[8];
+        GetFlowWeights(q, weights);
+        int oppositeDir = (i + 4) % 8;
+        if (weights[oppositeDir] > 0.0)
+        {
+            incomingSediment += weights[oppositeDir] * GetSediment(q);
+        }
+    }
+    
+    sediment += incomingSediment;
+    
+    int2 dir = GetSteepestNeighbor(pos);
+    int2 receiver = pos + dir;
+    float steepestSlope = IsInBounds(receiver) ? GetSlope(receiver, pos) : 0.0;
+    
+    float speed = clamp(pow(steepestSlope, 2.0), 0.0, 1.0);
+    float streamCapacity = pow(stream, 0.3) * speed;
+    
+    if (_DepositionStrength * sediment > streamCapacity)
+    {
+        float depositAmount = min(sediment, (_DepositionStrength * sediment - streamCapacity) * 0.1);
+        height += depositAmount;
+        sediment = max(0.0, sediment - depositAmount);
+    }
+    
+    sediment += 0.1 * streamCapacity;
+    
+    _OutHeightRT[pos] = height;
+    _SedimentRT[pos] = sediment;
 }
 
 [numthreads(8, 8, 1)]
 void Retargeting(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
     
+    float height = GetHeight(pos);
+    
+    float sumHeight = height * 4.0;
+    float sumWeights = 4.0;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 neighbor = pos + next8[i];
+        if (IsInBounds(neighbor))
+        {
+            float weight = (i % 2 == 0) ? 1.0 : 0.7;
+            sumHeight += GetHeight(neighbor) * weight;
+            sumWeights += weight;
+        }
+    }
+    
+    _TempRT[pos] = sumHeight / sumWeights;
 }
 
 [numthreads(8, 8, 1)]
 void Breaching(uint3 id : SV_DispatchThreadID)
 {
+    int2 pos = int2(id.xy);
+    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+        return;
     
+    float height = GetHeight(pos);
+    
+    bool isPit = true;
+    float minNeighborHeight = 1e10;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 neighbor = pos + next8[i];
+        if (!IsInBounds(neighbor))
+            continue;
+        
+        float neighborHeight = GetHeight(neighbor);
+        minNeighborHeight = min(minNeighborHeight, neighborHeight);
+        
+        if (neighborHeight <= height)
+            isPit = false;
+    }
+    
+    if (isPit && minNeighborHeight < 1e10)
+    {
+        height = minNeighborHeight + 0.001;
+    }
+    
+    _TempRT[pos] = height;
 }
