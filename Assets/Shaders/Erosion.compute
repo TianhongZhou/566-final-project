@@ -26,6 +26,17 @@ RWTexture2D<float> _SedimentRT;
 RWTexture2D<float> _RTToClear;
 Texture2D<float> _OrigHeightRT;
 
+Texture2D<float4> _MaterialTex; // R=rock, G=soil, B=snow, A unused
+
+// Per-material LUTs; xyz are used, w ignored
+uniform float4 _Mat_n; // slope exponent n   (rock, soil, snow)
+uniform float4 _Mat_m; // drainage exponent m
+uniform float4 _Mat_kE; // erosion coeff k_e
+uniform float4 _Mat_talusDeg; // talus angle in degrees
+uniform float4 _Mat_kC; // sediment creation coeff
+uniform float4 _Mat_kD; // deposition strength multiplier
+
+
 static const int2 next8[8] =
 {
     int2(0, 1), int2(1, 1), int2(1, 0), int2(1, -1),
@@ -231,6 +242,41 @@ float ComputeIncomingFlow(int2 p)
     return totalFlow;
 }
 
+float3 SampleMaterialWeights(int2 p)
+{
+    // Assume same resolution as height for now
+    uint w, h;
+    _MaterialTex.GetDimensions(w, h);
+
+    p.x = clamp(p.x, 0, (int) w - 1);
+    p.y = clamp(p.y, 0, (int) h - 1);
+
+    float4 rgba = _MaterialTex.Load(int3(p, 0));
+    float3 w3 = rgba.xyz;
+
+    float sum = w3.x + w3.y + w3.z;
+    if (sum < 1e-6)
+    {
+        return float3(1.0, 0.0, 0.0);
+    }
+
+    return w3 / sum;
+}
+
+void GetMaterialParams(int2 p,
+                       out float n, out float m, out float kE,
+                       out float talusDeg, out float kC, out float kD)
+{
+    float3 w = SampleMaterialWeights(p);
+
+    n = dot(w, _Mat_n.xyz);
+    m = dot(w, _Mat_m.xyz);
+    kE = dot(w, _Mat_kE.xyz);
+    talusDeg = dot(w, _Mat_talusDeg.xyz);
+    kC = dot(w, _Mat_kC.xyz);
+    kD = dot(w, _Mat_kD.xyz);
+}
+
 
 [numthreads(8, 8, 1)]
 void FlowRouting(uint3 id : SV_DispatchThreadID)
@@ -282,16 +328,22 @@ void ErosionStep(uint3 id : SV_DispatchThreadID)
     
     float receiverHeight = GetHeight(receiver);
     float steepestSlope = abs(GetSlope(receiver, pos));
-    
-    float streamPower = pow(stream, _ErosionPSA) * clamp(pow(steepestSlope, _ErosionPSL), 0.0, 1.0);
+
+    //per-material parameters
+    float n, m, kE, talusDeg, kC, kD;
+    GetMaterialParams(pos, n, m, kE, talusDeg, kC, kD);
+
+    // stream power with per-material exponents
+    float streamPower = pow(stream, m) * clamp(pow(steepestSlope, n), 0.0, 1.0);
     streamPower = clamp(streamPower, 0.0, 10000.0);
-    streamPower *= _ErosionK;
-    
+
+    // use per-material erosion coefficient
+    streamPower *= kE;
+
     float newHeight = currentHeight - _ErosionDT * streamPower;
     newHeight = max(newHeight, receiverHeight);
     
     _OutHeightRT[pos] = newHeight / _MaxHeight;
-
 }
 
 [numthreads(8, 8, 1)]
@@ -304,10 +356,13 @@ void ThermalStep(uint3 id : SV_DispatchThreadID)
     const float dOrtho = _CellSize;
     const float dDiag = _CellSize * 1.41421356;
 
-    const float s0 = tan(radians(_Talus)); 
+    // --- per-material talus ---
+    float n, m, kE, talusDeg, kC, kD;
+    GetMaterialParams(p, n, m, kE, talusDeg, kC, kD);
+    const float s0 = tan(radians(talusDeg));
 
-    const float hp = GetHeight(p); 
-    int alpha = 0; 
+    const float hp = GetHeight(p);
+    int alpha = 0;
     int beta = 0;
 
     [unroll]
@@ -320,19 +375,18 @@ void ThermalStep(uint3 id : SV_DispatchThreadID)
         const float hq = GetHeight(q);
         const float d = (next8[k].x == 0 || next8[k].y == 0) ? dOrtho : dDiag;
 
-        const float sp_to_q = (hp - hq) / d; 
+        const float sp_to_q = (hp - hq) / d;
 
         if (sp_to_q > s0)
-            alpha++; 
+            alpha++;
         if (sp_to_q < -s0)
-            beta++; 
+            beta++;
     }
 
-
-    const float kThermal = 0.02; 
+    const float kThermal = 0.02;
     const float hp_new = hp + _ThermalDT * kThermal * float(beta - alpha);
 
-    _TempRT[p] = hp_new / _MaxHeight; 
+    _TempRT[p] = hp_new / _MaxHeight;
 }
 
 
@@ -360,6 +414,10 @@ void DepositStep(uint3 id : SV_DispatchThreadID)
     float height = GetHeight(pos);
     float stream = GetStream(pos);
     float sediment = GetSediment(pos);
+
+    //per-material params
+    float n, m, kE, talusDeg, kC, kD;
+    GetMaterialParams(pos, n, m, kE, talusDeg, kC, kD);
     
     if (!CheckPit(pos))
     {
@@ -390,19 +448,24 @@ void DepositStep(uint3 id : SV_DispatchThreadID)
     
     float speed = clamp(pow(steepestSlope, 2.0), 0.0, 1.0);
     float streamCapacity = pow(stream, 0.3) * speed;
-    
-    if (_DepositionStrength * sediment > streamCapacity)
+
+    // global depositionStrength * per-material multiplier
+    float effKD = _DepositionStrength * kD;
+
+    if (effKD * sediment > streamCapacity)
     {
-        float depositAmount = min(sediment, (_DepositionStrength * sediment - streamCapacity) * 0.1);
+        float depositAmount = min(sediment, (effKD * sediment - streamCapacity) * 0.1);
         height += depositAmount;
         sediment = max(0.0, sediment - depositAmount);
     }
-    
-    sediment += 0.1 * streamCapacity;
+
+    // create sediment proportional to capacity, scaled by kC
+    sediment += kC * streamCapacity;
     
     _OutHeightRT[pos] = height / _MaxHeight;
     _SedimentRT[pos] = sediment;
 }
+
 
 [numthreads(8, 8, 1)]
 void Retargeting(uint3 id : SV_DispatchThreadID)

@@ -7,8 +7,7 @@ using System.Text;
 
 public class GpuTerrainPipeline : MonoBehaviour
 {
-    [Header("Input")]
-    public Texture2D inputHeight;
+    
 
     [Header("Terrain")]
     public Terrain targetTerrain;       
@@ -20,6 +19,43 @@ public class GpuTerrainPipeline : MonoBehaviour
 
     [Header("Pipeline Settings")]
     public float baseResolution = 256f;
+
+    [Header("Input")]
+    public Texture2D inputHeight;
+
+    [System.Serializable]
+    public struct MaterialLUT
+    {
+        // slope exponent n (per material)
+        public Vector3 n;      
+
+        // drainage exponent m (per material)
+        public Vector3 m;
+
+        // stream power erosion coefficient k_e (per material)
+        public Vector3 kE;
+
+        // talus angle in degrees (per material)
+        public Vector3 talusDeg;
+
+        // sediment creation coeff (per material)
+        public Vector3 kC;
+
+        // deposition strength multiplier (per material)
+        public Vector3 kD;
+    }
+
+    [Header("Material LUT")]
+    public MaterialLUT materialLUT = new MaterialLUT
+    {
+    
+        n = new Vector3(2.2f, 2.0f, 1.8f),    // rock, soil, snow
+        m = new Vector3(0.7f, 0.8f, 1.0f),
+        kE = new Vector3(2e-4f, 5e-4f, 8e-4f),
+        talusDeg = new Vector3(40f, 30f, 20f),
+        kC = new Vector3(0.05f, 0.10f, 0.15f),
+        kD = new Vector3(0.05f, 0.10f, 0.20f),
+    };
 
     int kCopyFromTexture;
     int kUpsample2x;
@@ -215,7 +251,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             {
                 FlowRoutingOnce(height, stream, temp);
                 Swap(ref stream, ref temp);
-                ErodeOnce(height, stream, temp);
+                ErodeOnce(height, stream, temp, level);
                 Swap(ref height, ref temp);
             }
 
@@ -223,7 +259,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             Debug.Log($"  Thermal: {schedule.thermalSteps} steps");
             for (int i = 0; i < schedule.thermalSteps; i++)
             {
-                ThermalOnce(height, temp);
+                ThermalOnce(height, temp, level);
                 Swap(ref height, ref temp);
             }
 
@@ -233,7 +269,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             {
                 FlowRoutingOnce(height, stream, temp);
                 Swap(ref stream, ref temp);
-                DepositOnce(height, stream, sediment, temp);
+                DepositOnce(height, stream, sediment, temp, level);
                 Swap(ref height, ref temp);
             }
 
@@ -251,7 +287,6 @@ public class GpuTerrainPipeline : MonoBehaviour
             RenderTexture finalTemp = tempRTs[levels.Length - 1];
             RenderTexture finalStream = streamRTs[levels.Length - 1];
 
-            // Optional: recompute flow once so stream is fresh before breaching/retargeting
             FlowRoutingOnce(finalHeight, finalStream, finalTemp);
             Swap(ref finalStream, ref finalTemp);
 
@@ -298,29 +333,35 @@ public class GpuTerrainPipeline : MonoBehaviour
         DispatchFor(height, kFlowRouting);
     }
 
-    void ErodeOnce(RenderTexture height, RenderTexture stream, RenderTexture dst)
+    void ErodeOnce(RenderTexture height, RenderTexture stream, RenderTexture dst, int level)
     {
         SetCommonUniforms(height);
         SetErosionUniforms();
+        SetMaterialUniforms(kErode, level);
+
         erosionCS.SetTexture(kErode, "_InHeightRT", height);
         erosionCS.SetTexture(kErode, "_StreamRT", stream);
         erosionCS.SetTexture(kErode, "_OutHeightRT", dst);
         DispatchFor(height, kErode);
     }
 
-    void ThermalOnce(RenderTexture height, RenderTexture dst)
+    void ThermalOnce(RenderTexture height, RenderTexture dst, int level)
     {
         SetCommonUniforms(height);
         SetThermalUniforms();
+        SetMaterialUniforms(kThermal, level);
+
         erosionCS.SetTexture(kThermal, "_InHeightRT", height);
         erosionCS.SetTexture(kThermal, "_TempRT", dst);
         DispatchFor(height, kThermal);
     }
 
-    void DepositOnce(RenderTexture height, RenderTexture stream, RenderTexture sediment, RenderTexture dst)
+    void DepositOnce(RenderTexture height, RenderTexture stream, RenderTexture sediment, RenderTexture dst, int level)
     {
         SetCommonUniforms(height);
         SetDepositionUniforms();
+        SetMaterialUniforms(kDeposit, level);
+
         erosionCS.SetTexture(kDeposit, "_InHeightRT", height);
         erosionCS.SetTexture(kDeposit, "_StreamRT", stream);
         erosionCS.SetTexture(kDeposit, "_SedimentRT", sediment);
@@ -373,11 +414,9 @@ public class GpuTerrainPipeline : MonoBehaviour
             erosionCS.SetTexture(kBreach, "_TempRT", dst);
             DispatchFor(height, kBreach);
 
-            // Now the new terrain is in 'dst'; make it the source for the next radius
             Swap(ref height, ref dst);
         }
 
-        // Persist the final result back into your dictionaries
         heightRTs[levels.Length - 1] = height;
         tempRTs[levels.Length - 1] = dst;
     }
@@ -411,6 +450,29 @@ public class GpuTerrainPipeline : MonoBehaviour
         erosionCS.SetFloat("_DepositionStrength", depositionStrength);
         erosionCS.SetFloat("_RainIntensity", rainIntensity);
         erosionCS.SetFloat("_FlowP", flowP);
+    }
+
+    void SetMaterialUniforms(int kernel, int level)
+    {
+        Texture2D mat = null;
+
+        if (materialMaps != null && materialMaps.Length > 0)
+        {
+            int idx = Mathf.Min(level, materialMaps.Length - 1); // clamp
+            mat = materialMaps[idx];
+        }
+
+        if (mat != null)
+        {
+            erosionCS.SetTexture(kernel, "_MaterialTex", mat);
+        }
+
+        erosionCS.SetVector("_Mat_n", new Vector4(materialLUT.n.x, materialLUT.n.y, materialLUT.n.z, 0f));
+        erosionCS.SetVector("_Mat_m", new Vector4(materialLUT.m.x, materialLUT.m.y, materialLUT.m.z, 0f));
+        erosionCS.SetVector("_Mat_kE", new Vector4(materialLUT.kE.x, materialLUT.kE.y, materialLUT.kE.z, 0f));
+        erosionCS.SetVector("_Mat_talusDeg", new Vector4(materialLUT.talusDeg.x, materialLUT.talusDeg.y, materialLUT.talusDeg.z, 0f));
+        erosionCS.SetVector("_Mat_kC", new Vector4(materialLUT.kC.x, materialLUT.kC.y, materialLUT.kC.z, 0f));
+        erosionCS.SetVector("_Mat_kD", new Vector4(materialLUT.kD.x, materialLUT.kD.y, materialLUT.kD.z, 0f));
     }
 
     void DispatchFor(RenderTexture rt, int kernel)
