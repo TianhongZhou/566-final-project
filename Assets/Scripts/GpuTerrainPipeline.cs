@@ -45,6 +45,8 @@ public class GpuTerrainPipeline : MonoBehaviour
         public Vector3 kD;
     }
 
+    public Texture2D[] materialMaps;
+
     [Header("Material LUT")]
     public MaterialLUT materialLUT = new MaterialLUT
     {
