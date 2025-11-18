@@ -25,6 +25,18 @@ RWTexture2D<float> _TempRT;
 RWTexture2D<float> _SedimentRT;
 RWTexture2D<float> _RTToClear;
 Texture2D<float> _OrigHeightRT;
+RWTexture2D<float> _SnowRT;
+Texture2D<float4> _MaterialTex; // R=rock, G=soil, B=snow, A unused
+
+// Per-material LUTs; xyz are used, w ignored
+uniform float4 _Mat_n; // slope exponent n   (rock, soil, snow)
+uniform float4 _Mat_m; // drainage exponent m
+uniform float4 _Mat_kE; // erosion coeff k_e
+uniform float4 _Mat_talusDeg; // talus angle in degrees
+uniform float4 _Mat_kC; // sediment creation coeff
+uniform float4 _Mat_kD; // deposition strength multiplier
+uniform float4 _Mat_rain;
+
 
 static const int2 next8[8] =
 {
@@ -35,9 +47,6 @@ static const int2 next8[8] =
 uniform float _RainIntensity = 2.6;
 
 uniform float _FlowP = 1.3;
-uniform float _ErosionK = 0.0005;
-uniform float _ErosionPSA = 0.8;
-uniform float _ErosionPSL = 2.0;
 uniform float _ErosionDT = 1.0;
 
 static const float orthoDist = 1.0;
@@ -231,20 +240,48 @@ float ComputeIncomingFlow(int2 p)
     return totalFlow;
 }
 
-
-[numthreads(8, 8, 1)]
-void FlowRouting(uint3 id : SV_DispatchThreadID)
+float3 SampleMaterialWeights(int2 p)
 {
-    int2 pos = int2(id.xy);
-    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
-        return;
-    
-    float cellArea = _CellSize * _CellSize;
-    float stream = cellArea * _RainIntensity;
-    
-    stream += ComputeIncomingFlow(pos);
-    
-    _OutStreamRT[pos] = stream;
+    // Assume same resolution as height for now
+    uint w, h;
+    _MaterialTex.GetDimensions(w, h);
+
+    p.x = clamp(p.x, 0, (int) w - 1);
+    p.y = clamp(p.y, 0, (int) h - 1);
+
+    float4 rgba = _MaterialTex.Load(int3(p, 0));
+    float3 w3 = rgba.xyz;
+
+    float sum = w3.x + w3.y + w3.z;
+    if (sum < 1e-6)
+    {
+        return float3(1.0, 0.0, 0.0);
+    }
+
+    return w3 / sum;
+}
+
+void GetMaterialParams(int2 p,
+                       out float n, out float m, out float kE,
+                       out float talusDeg, out float kC, out float kD, out float rain)
+{
+    float3 w = SampleMaterialWeights(p);
+
+    n = dot(w, _Mat_n.xyz);
+    m = dot(w, _Mat_m.xyz);
+    kE = dot(w, _Mat_kE.xyz);
+    talusDeg = dot(w, _Mat_talusDeg.xyz);
+    kC = dot(w, _Mat_kC.xyz);
+    kD = dot(w, _Mat_kD.xyz);
+    rain = dot(w, _Mat_rain.xyz);
+}
+
+float GetCombinedHeight(int2 p)
+{
+    p = GetClampedCoord(p);
+    float h01 = _InHeightRT[p];
+    float snow = _SnowRT[p];
+    return h01 * _MaxHeight; 
 }
 
 int2 GetSteepestNeighbor(int2 p)
@@ -265,33 +302,113 @@ int2 GetSteepestNeighbor(int2 p)
 }
 
 [numthreads(8, 8, 1)]
+void FlowRouting(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = int2(id.xy);
+    if (!IsInBounds(pos))
+        return;
+
+    float3 matW = SampleMaterialWeights(pos);
+    float wRock = matW.x;
+    float wSoil = matW.y;
+    float wSnow = matW.z;
+
+    float baseRain = _CellSize * _CellSize * _RainIntensity;
+
+    // ---- Snow: diffusion-like flow ----
+    if (wSnow > max(wRock, wSoil))
+    {
+        float self = GetStream(pos);
+        float sum = 0.0;
+        float cnt = 0.0;
+        [unroll]
+        for (int i = 0; i < 8; ++i)
+        {
+            int2 q = pos + next8[i];
+            if (!IsInBounds(q))
+                continue;
+            sum += GetStream(q);
+            cnt += 1.0;
+        }
+        float neighAvg = (cnt > 0.0) ? (sum / cnt) : self;
+
+        float newStream = baseRain + lerp(self, neighAvg, 0.8) * 0.3 + ComputeIncomingFlow(pos) * 0.3;
+        _OutStreamRT[pos] = newStream;
+        return;
+    }
+
+    // ---- Soil: steepest dir flow ----
+    if (wSoil > wRock)
+    {
+        int2 d = GetSteepestNeighbor(pos);
+        int2 src = pos + d;
+        float upstream = GetStream(src);
+        float stream = baseRain + ComputeIncomingFlow(pos) - upstream * 5.0;
+        _OutStreamRT[pos] = stream;
+        return;
+    }
+
+    // ---- Rock: weighted multi-direction routing ----
+    float streamRock = baseRain + ComputeIncomingFlow(pos);
+    _OutStreamRT[pos] = streamRock;
+}
+
+[numthreads(8, 8, 1)]
 void ErosionStep(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.xy);
-    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+    if (!IsInBounds(pos))
         return;
-    
-    float currentHeight = GetHeight(pos);
+
+    float3 matW = SampleMaterialWeights(pos);
+    float wRock = matW.x;
+    float wSoil = matW.y;
+    float wSnow = matW.z;
+
+    float n, m, kE, talusDeg, kC, kD, rain;
+    GetMaterialParams(pos, n, m, kE, talusDeg, kC, kD, rain);
+
+    float combinedH = GetCombinedHeight(pos);
+    float snow = _SnowRT[pos];
+    float baseH = combinedH - snow;
     float stream = GetStream(pos);
-    
+
     int2 dir = GetSteepestNeighbor(pos);
     int2 receiver = pos + dir;
-    
-    if (!IsInBounds(receiver))
-        return;
-    
-    float receiverHeight = GetHeight(receiver);
-    float steepestSlope = abs(GetSlope(receiver, pos));
-    
-    float streamPower = pow(stream, _ErosionPSA) * clamp(pow(steepestSlope, _ErosionPSL), 0.0, 1.0);
-    streamPower = clamp(streamPower, 0.0, 10000.0);
-    streamPower *= _ErosionK;
-    
-    float newHeight = currentHeight - _ErosionDT * streamPower;
-    newHeight = max(newHeight, receiverHeight);
-    
-    _OutHeightRT[pos] = newHeight / _MaxHeight;
 
+    float receiverH = IsInBounds(receiver) ? GetCombinedHeight(receiver) : combinedH;
+    float slopeAbs = abs(GetSlope(receiver, pos));
+    
+    float streamPower = pow(max(stream, 0.0), m) * clamp(pow(slopeAbs, n), 0.0, 1.0);
+    streamPower = clamp(streamPower, 0.0, 10000.0);
+    streamPower *= kE * _ErosionDT;
+
+    // ---- Snow: melt ----
+    if (wSnow > max(wRock, wSoil))
+    {
+        // stream larger, melt faster
+        float meltRate = kE * pow(max(stream, 0.0), m) * _ErosionDT; // melt model
+        meltRate = min(meltRate, snow);
+
+        snow -= meltRate;
+        baseH += meltRate + streamPower;
+
+        float newCombined = baseH + snow;
+        _SnowRT[pos] = snow;
+        _OutHeightRT[pos] = newCombined / _MaxHeight;
+        return;
+    }
+
+    // ---- Rock / Soil：classic stream-power erosion ----
+    {
+        baseH = baseH - streamPower;
+        baseH = max(baseH, receiverH - snow);
+
+        float newCombined = baseH + snow;
+        _SnowRT[pos] = snow;
+        _OutHeightRT[pos] = newCombined / _MaxHeight;
+        return;
+    }
 }
 
 [numthreads(8, 8, 1)]
@@ -301,40 +418,85 @@ void ThermalStep(uint3 id : SV_DispatchThreadID)
     if (!IsInBounds(p))
         return;
 
-    const float dOrtho = _CellSize;
-    const float dDiag = _CellSize * 1.41421356;
+    float3 matW = SampleMaterialWeights(p);
+    float wRock = matW.x;
+    float wSoil = matW.y;
+    float wSnow = matW.z;
 
-    const float s0 = tan(radians(_Talus)); 
+    float n, m, kE, talusDeg, kC, kD, rain;
+    GetMaterialParams(p, n, m, kE, talusDeg, kC, kD, rain);
 
-    const float hp = GetHeight(p); 
-    int alpha = 0; 
-    int beta = 0;
+    float combinedH = GetCombinedHeight(p);
+    float snow = _SnowRT[p];
+    float baseH = combinedH - snow;
 
-    [unroll]
-    for (int k = 0; k < 8; ++k)
+    // ---- Rock ----
+    if (wRock > max(wSoil, wSnow))
     {
-        const int2 q = p + next8[k];
-        if (!IsInBounds(q))
-            continue;
-
-        const float hq = GetHeight(q);
-        const float d = (next8[k].x == 0 || next8[k].y == 0) ? dOrtho : dDiag;
-
-        const float sp_to_q = (hp - hq) / d; 
-
-        if (sp_to_q > s0)
-            alpha++; 
-        if (sp_to_q < -s0)
-            beta++; 
+        _TempRT[p] = (baseH + snow) / _MaxHeight;
+        return;
     }
 
+    // ---- Snow：strong avalanche smoothing ----
+    if (wSnow > wSoil)
+    {
+        float sum = 0.0;
+        float cnt = 0.0;
+        const int R = 2;
+        for (int dy = -R; dy <= R; ++dy)
+        {
+            for (int dx = -R; dx <= R; ++dx)
+            {
+                int2 q = p + int2(dx, dy);
+                if (!IsInBounds(q))
+                    continue;
+                sum += GetCombinedHeight(q);
+                cnt += 1.0;
+            }
+        }
+        float avg = (cnt > 0.0) ? (sum / cnt) : combinedH;
 
-    const float kThermal = 0.02; 
-    const float hp_new = hp + _ThermalDT * kThermal * float(beta - alpha);
+        float newCombined = lerp(combinedH, avg, 0.01 * _ThermalDT);
+        _TempRT[p] = newCombined / _MaxHeight;
+        return;
+    }
 
-    _TempRT[p] = hp_new / _MaxHeight; 
+    // ---- Soil：mass-wasting based on talus ----
+    {
+        const float dOrtho = _CellSize;
+        const float dDiag = _CellSize * 1.41421356;
+        const float hp = baseH;
+
+        float talusRad = radians(talusDeg);
+        float s0 = tan(talusRad);
+
+        int alpha = 0;
+        int beta = 0;
+
+        [unroll]
+        for (int k = 0; k < 8; ++k)
+        {
+            int2 q = p + next8[k];
+            if (!IsInBounds(q))
+                continue;
+
+            float hq = GetCombinedHeight(q);
+            float d = (next8[k].x == 0 || next8[k].y == 0) ? dOrtho : dDiag;
+            float sp_to_q = (hp - hq) / d;
+
+            if (sp_to_q > s0)
+                alpha++;
+            if (sp_to_q < -s0)
+                beta++;
+        }
+
+        const float kThermal = 0.02;
+        float hpNew = hp + _ThermalDT * kThermal * float(beta - alpha) * 0.4;
+
+        float newCombined = hpNew + snow;
+        _TempRT[p] = newCombined / _MaxHeight;
+    }
 }
-
 
 bool CheckPit(int2 p)
 {
@@ -354,54 +516,110 @@ bool CheckPit(int2 p)
 void DepositStep(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.xy);
-    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
+    if (!IsInBounds(pos))
         return;
-    
-    float height = GetHeight(pos);
+
+    float3 matW = SampleMaterialWeights(pos);
+    float wRock = matW.x;
+    float wSoil = matW.y;
+    float wSnow = matW.z;
+
+    float n, m, kE, talusDeg, kC, kD, rain;
+    GetMaterialParams(pos, n, m, kE, talusDeg, kC, kD, rain);
+
+    float combinedH = GetCombinedHeight(pos);
+    float snow = _SnowRT[pos];
+    float baseH = combinedH - snow;
+
     float stream = GetStream(pos);
     float sediment = GetSediment(pos);
-    
-    if (!CheckPit(pos))
+
+    // ---- Rock ----
+    if (wRock > max(wSoil, wSnow))
     {
         sediment = 0.0;
     }
-    
+
+    // ---- Soil & Snow ---- share incoming weighted sediment
     float incomingSediment = 0.0;
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 8; ++i)
     {
         int2 q = pos + next8[i];
         if (!IsInBounds(q))
             continue;
-        
+
         float weights[8];
         GetFlowWeights(q, weights);
-        int oppositeDir = (i + 4) % 8;
-        if (weights[oppositeDir] > 0.0)
-        {
-            incomingSediment += weights[oppositeDir] * GetSediment(q);
-        }
+        int opposite = (i + 4) % 8;
+
+        if (weights[opposite] > 0.0)
+            incomingSediment += weights[opposite] * GetSediment(q);
     }
-    
     sediment += incomingSediment;
-    
+
+    // recompute slope & capacity
     int2 dir = GetSteepestNeighbor(pos);
     int2 receiver = pos + dir;
     float steepestSlope = IsInBounds(receiver) ? GetSlope(receiver, pos) : 0.0;
-    
+
     float speed = clamp(pow(steepestSlope, 2.0), 0.0, 1.0);
-    float streamCapacity = pow(stream, 0.3) * speed;
-    
-    if (_DepositionStrength * sediment > streamCapacity)
+    float streamCapacity = pow(max(stream, 0.0), 0.3) * speed;
+
+    float effKD = _DepositionStrength * kD;
+
+    // ---- Snow：edit snow level ----
+    if (wSnow > max(wRock, wSoil))
     {
-        float depositAmount = min(sediment, (_DepositionStrength * sediment - streamCapacity) * 0.1);
-        height += depositAmount;
-        sediment = max(0.0, sediment - depositAmount);
+        if (effKD * sediment > streamCapacity)
+        {
+            float depositAmount = min(sediment, (effKD * sediment - streamCapacity) * 0.1);
+            snow += depositAmount;
+            sediment = max(0.0, sediment - depositAmount);
+        }
+
+        _SnowRT[pos] = snow;
+        float newCombined = baseH + snow;
+        _OutHeightRT[pos] = newCombined / _MaxHeight;
+        _SedimentRT[pos] = sediment;
+        return;
     }
-    
-    sediment += 0.1 * streamCapacity;
-    
-    _OutHeightRT[pos] = height / _MaxHeight;
-    _SedimentRT[pos] = sediment;
+
+    // ---- Soil ----
+    if (wSoil > wRock)
+    {
+        if (!CheckPit(pos))
+        {
+            sediment *= 0.3;
+        }
+
+        if (effKD * sediment > streamCapacity)
+        {
+            float depositAmount = min(sediment, (effKD * sediment - streamCapacity) * 0.1);
+            
+            float receiverH = IsInBounds(receiver) ? GetCombinedHeight(receiver) : combinedH;
+            if (receiverH > combinedH)
+            {
+                baseH += depositAmount;
+                sediment = max(0.0, sediment - depositAmount);
+            }
+        }
+
+        sediment += kC * streamCapacity;
+
+        float newCombined = baseH + snow;
+        _SnowRT[pos] = snow;
+        _OutHeightRT[pos] = newCombined / _MaxHeight;
+        _SedimentRT[pos] = sediment;
+        return;
+    }
+
+    // ---- Rock fallback ----
+    {
+        float newCombined = baseH + snow;
+        _SnowRT[pos] = snow;
+        _OutHeightRT[pos] = newCombined / _MaxHeight;
+        _SedimentRT[pos] = sediment;
+    }
 }
 
 [numthreads(8, 8, 1)]
