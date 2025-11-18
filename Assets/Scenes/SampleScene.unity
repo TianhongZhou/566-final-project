@@ -506,7 +506,7 @@ MonoBehaviour:
   erosionCS: {fileID: 7200000, guid: f03bb276a36b8dc47909477c28e5996a, type: 3}
   baseResolution: 256
   inputHeight: {fileID: 2800000, guid: ea01fb95a90db2540a8b3e73af8c365e, type: 3}
-  materialMaps: {fileID: 642781895}
+  materialMaps: {fileID: 1084698131}
   materialLUT:
     rain: {x: 0.5, y: 1, z: 1.5}
     n: {x: 2.2, y: 2, z: 1.8}
@@ -517,14 +517,14 @@ MonoBehaviour:
     kD: {x: 0.05, y: 0.1, z: 0.2}
   levels:
   - erosionSteps: 3000
-    thermalSteps: 0
-    depositionSteps: 0
+    thermalSteps: 200
+    depositionSteps: 50
   - erosionSteps: 3000
-    thermalSteps: 0
-    depositionSteps: 0
+    thermalSteps: 200
+    depositionSteps: 50
   - erosionSteps: 3000
-    thermalSteps: 0
-    depositionSteps: 0
+    thermalSteps: 200
+    depositionSteps: 50
   erosionDT: 1
   flowP: 1.3
   rainIntensity: 2.6
@@ -561,7 +561,7 @@ MonoBehaviour:
   pipeline: {fileID: 429945725}
   width: 256
   height: 256
---- !u!28 &642781895
+--- !u!28 &1084698131
 Texture2D:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
