@@ -343,7 +343,7 @@ void FlowRouting(uint3 id : SV_DispatchThreadID)
         int2 d = GetSteepestNeighbor(pos);
         int2 src = pos + d;
         float upstream = GetStream(src);
-        float stream = baseRain + ComputeIncomingFlow(pos) - upstream * 3.0;
+        float stream = baseRain + ComputeIncomingFlow(pos) - upstream * 5.0;
         _OutStreamRT[pos] = stream;
         return;
     }
@@ -411,49 +411,6 @@ void ErosionStep(uint3 id : SV_DispatchThreadID)
     }
 }
 
-//[numthreads(8, 8, 1)]
-//void ThermalStep(uint3 id : SV_DispatchThreadID)
-//{
-//    const int2 p = int2(id.xy);
-//    if (!IsInBounds(p))
-//        return;
-
-//    const float dOrtho = _CellSize;
-//    const float dDiag = _CellSize * 1.41421356;
-
-//    // --- per-material talus ---
-//    float n, m, kE, talusDeg, kC, kD, rain;
-//    GetMaterialParams(p, n, m, kE, talusDeg, kC, kD, rain);
-//    const float s0 = tan(radians(talusDeg));
-
-//    const float hp = GetHeight(p);
-//    int alpha = 0;
-//    int beta = 0;
-
-//    [unroll]
-//    for (int k = 0; k < 8; ++k)
-//    {
-//        const int2 q = p + next8[k];
-//        if (!IsInBounds(q))
-//            continue;
-
-//        const float hq = GetHeight(q);
-//        const float d = (next8[k].x == 0 || next8[k].y == 0) ? dOrtho : dDiag;
-
-//        const float sp_to_q = (hp - hq) / d;
-
-//        if (sp_to_q > s0)
-//            alpha++;
-//        if (sp_to_q < -s0)
-//            beta++;
-//    }
-
-//    const float kThermal = 0.02;
-//    const float hp_new = hp + _ThermalDT * kThermal * float(beta - alpha);
-
-//    _TempRT[p] = hp_new / _MaxHeight;
-//}
-
 [numthreads(8, 8, 1)]
 void ThermalStep(uint3 id : SV_DispatchThreadID)
 {
@@ -499,7 +456,7 @@ void ThermalStep(uint3 id : SV_DispatchThreadID)
         }
         float avg = (cnt > 0.0) ? (sum / cnt) : combinedH;
 
-        float newCombined = lerp(combinedH, avg, 0.6 * _ThermalDT);
+        float newCombined = lerp(combinedH, avg, 0.01 * _ThermalDT);
         _TempRT[p] = newCombined / _MaxHeight;
         return;
     }
@@ -534,7 +491,7 @@ void ThermalStep(uint3 id : SV_DispatchThreadID)
         }
 
         const float kThermal = 0.02;
-        float hpNew = hp + _ThermalDT * kThermal * float(beta - alpha);
+        float hpNew = hp + _ThermalDT * kThermal * float(beta - alpha) * 0.4;
 
         float newCombined = hpNew + snow;
         _TempRT[p] = newCombined / _MaxHeight;
@@ -554,68 +511,6 @@ bool CheckPit(int2 p)
     }
     return true;
 }
-
-//[numthreads(8, 8, 1)]
-//void DepositStep(uint3 id : SV_DispatchThreadID)
-//{
-//    int2 pos = int2(id.xy);
-//    if (pos.x >= (int) _Width || pos.y >= (int) _Height)
-//        return;
-    
-//    float height = GetHeight(pos);
-//    float stream = GetStream(pos);
-//    float sediment = GetSediment(pos);
-
-//    //per-material params
-//    float n, m, kE, talusDeg, kC, kD, rain;
-//    GetMaterialParams(pos, n, m, kE, talusDeg, kC, kD, rain);
-    
-//    if (!CheckPit(pos))
-//    {
-//        sediment = 0.0;
-//    }
-    
-//    float incomingSediment = 0.0;
-//    for (int i = 0; i < 8; i++)
-//    {
-//        int2 q = pos + next8[i];
-//        if (!IsInBounds(q))
-//            continue;
-        
-//        float weights[8];
-//        GetFlowWeights(q, weights);
-//        int oppositeDir = (i + 4) % 8;
-//        if (weights[oppositeDir] > 0.0)
-//        {
-//            incomingSediment += weights[oppositeDir] * GetSediment(q);
-//        }
-//    }
-    
-//    sediment += incomingSediment;
-    
-//    int2 dir = GetSteepestNeighbor(pos);
-//    int2 receiver = pos + dir;
-//    float steepestSlope = IsInBounds(receiver) ? GetSlope(receiver, pos) : 0.0;
-    
-//    float speed = clamp(pow(steepestSlope, 2.0), 0.0, 1.0);
-//    float streamCapacity = pow(stream, 0.3) * speed;
-
-//    // global depositionStrength * per-material multiplier
-//    float effKD = _DepositionStrength * kD;
-
-//    if (effKD * sediment > streamCapacity)
-//    {
-//        float depositAmount = min(sediment, (effKD * sediment - streamCapacity) * 0.1);
-//        height += depositAmount;
-//        sediment = max(0.0, sediment - depositAmount);
-//    }
-
-//    // create sediment proportional to capacity, scaled by kC
-//    sediment += kC * streamCapacity;
-    
-//    _OutHeightRT[pos] = height / _MaxHeight;
-//    _SedimentRT[pos] = sediment;
-//}
 
 [numthreads(8, 8, 1)]
 void DepositStep(uint3 id : SV_DispatchThreadID)
