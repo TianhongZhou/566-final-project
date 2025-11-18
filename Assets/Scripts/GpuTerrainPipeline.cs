@@ -26,6 +26,9 @@ public class GpuTerrainPipeline : MonoBehaviour
     [System.Serializable]
     public struct MaterialLUT
     {
+        // rain weight
+        public Vector3 rain;
+
         // slope exponent n (per material)
         public Vector3 n;      
 
@@ -45,13 +48,13 @@ public class GpuTerrainPipeline : MonoBehaviour
         public Vector3 kD;
     }
 
-    public Texture2D[] materialMaps;
+    public Texture2D materialMaps;
 
     [Header("Material LUT")]
     public MaterialLUT materialLUT = new MaterialLUT
     {
-    
-        n = new Vector3(2.2f, 2.0f, 1.8f),    // rock, soil, snow
+        rain = new Vector3(0.5f, 1.0f, 1.5f),
+        n = new Vector3(2.2f, 2.0f, 1.8f),
         m = new Vector3(0.7f, 0.8f, 1.0f),
         kE = new Vector3(2e-4f, 5e-4f, 8e-4f),
         talusDeg = new Vector3(40f, 30f, 20f),
@@ -89,14 +92,9 @@ public class GpuTerrainPipeline : MonoBehaviour
     private Dictionary<int, RenderTexture> streamRTs = new Dictionary<int, RenderTexture>();
     private Dictionary<int, RenderTexture> sedimentRTs = new Dictionary<int, RenderTexture>();
     private Dictionary<int, RenderTexture> tempRTs = new Dictionary<int, RenderTexture>();
+    private Dictionary<int, RenderTexture> snowRTs = new Dictionary<int, RenderTexture>();
 
     [Header("Erosion Parameters")]
-    //[Range(0.0001f, 0.001f)]
-    public float erosionK = 0.0005f;
-    //[Range(0.5f, 1.5f)]
-    public float erosionPSA = 0.8f;
-    //[Range(1.0f, 3.0f)]
-    public float erosionPSL = 2.0f;
     //[Range(0.1f, 5.0f)]
     public float erosionDT = 1.0f;
     //[Range(1.0f, 5.0f)]
@@ -198,6 +196,8 @@ public class GpuTerrainPipeline : MonoBehaviour
                 sedimentRTs[level] = CreateRT(w, h);
             if (!tempRTs.ContainsKey(level))
                 tempRTs[level] = CreateRT(w, h);
+            if (!snowRTs.ContainsKey(level))
+                snowRTs[level] = CreateRT(w, h);
 
             w *= 2;
             h *= 2;
@@ -207,9 +207,15 @@ public class GpuTerrainPipeline : MonoBehaviour
         {
             if (!heightRTs.ContainsKey(0))
                 heightRTs[0] = CreateRT(w, h);
+            if (!snowRTs.ContainsKey(0))
+                snowRTs[0] = CreateRT(w, h);
         }
 
         CopyTextureToRT(inputHeight, heightRTs[0]);
+        foreach (var kv in snowRTs)
+        {
+            ClearRT(kv.Value);
+        }
     }
 
     void RunMultiscalePipeline()
@@ -226,6 +232,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             RenderTexture stream = streamRTs[level];
             RenderTexture sediment = sedimentRTs[level];
             RenderTexture temp = tempRTs[level];
+            RenderTexture snow = snowRTs[level];
 
             var schedule = levels[level];
 
@@ -251,9 +258,9 @@ public class GpuTerrainPipeline : MonoBehaviour
             Debug.Log($"  Erosion: {schedule.erosionSteps} steps");
             for (int i = 0; i < schedule.erosionSteps; i++)
             {
-                FlowRoutingOnce(height, stream, temp);
+                FlowRoutingOnce(height, stream, snow, temp);
                 Swap(ref stream, ref temp);
-                ErodeOnce(height, stream, temp, level);
+                ErodeOnce(height, stream, snow, temp);
                 Swap(ref height, ref temp);
             }
 
@@ -261,7 +268,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             Debug.Log($"  Thermal: {schedule.thermalSteps} steps");
             for (int i = 0; i < schedule.thermalSteps; i++)
             {
-                ThermalOnce(height, temp, level);
+                ThermalOnce(height, snow, temp);
                 Swap(ref height, ref temp);
             }
 
@@ -269,9 +276,9 @@ public class GpuTerrainPipeline : MonoBehaviour
             Debug.Log($"  Deposition: {schedule.depositionSteps} steps");
             for (int i = 0; i < schedule.depositionSteps; i++)
             {
-                FlowRoutingOnce(height, stream, temp);
+                FlowRoutingOnce(height, stream, snow, temp);
                 Swap(ref stream, ref temp);
-                DepositOnce(height, stream, sediment, temp, level);
+                DepositOnce(height, stream, sediment, snow, temp);
                 Swap(ref height, ref temp);
             }
 
@@ -280,6 +287,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             streamRTs[level] = stream;
             sedimentRTs[level] = sediment;
             tempRTs[level] = temp;
+            snowRTs[level] = snow;
         }
 
         if (levels.Length > 0)
@@ -288,8 +296,9 @@ public class GpuTerrainPipeline : MonoBehaviour
             RenderTexture finalHeight = heightRTs[levels.Length - 1];
             RenderTexture finalTemp = tempRTs[levels.Length - 1];
             RenderTexture finalStream = streamRTs[levels.Length - 1];
+            RenderTexture finalSnow = snowRTs[levels.Length - 1];
 
-            FlowRoutingOnce(finalHeight, finalStream, finalTemp);
+            FlowRoutingOnce(finalHeight, finalStream, finalSnow, finalTemp);
             Swap(ref finalStream, ref finalTemp);
 
             // (B) Multi-scale partial breaching (coarse->fine)
@@ -325,49 +334,55 @@ public class GpuTerrainPipeline : MonoBehaviour
         DispatchFor(dst, kUpsample2x);
     }
 
-    void FlowRoutingOnce(RenderTexture height, RenderTexture stream, RenderTexture dst)
+    void FlowRoutingOnce(RenderTexture height, RenderTexture stream, RenderTexture snow, RenderTexture dst)
     {
         SetCommonUniforms(height);
         SetErosionUniforms();
+        SetMaterialUniforms(kFlowRouting);
+
         erosionCS.SetTexture(kFlowRouting, "_InHeightRT", height);
         erosionCS.SetTexture(kFlowRouting, "_StreamRT", stream);
         erosionCS.SetTexture(kFlowRouting, "_OutStreamRT", dst);
+        erosionCS.SetTexture(kFlowRouting, "_SnowRT", snow);
         DispatchFor(height, kFlowRouting);
     }
 
-    void ErodeOnce(RenderTexture height, RenderTexture stream, RenderTexture dst, int level)
+    void ErodeOnce(RenderTexture height, RenderTexture stream, RenderTexture snow, RenderTexture dst)
     {
         SetCommonUniforms(height);
         SetErosionUniforms();
-        SetMaterialUniforms(kErode, level);
+        SetMaterialUniforms(kErode);
 
         erosionCS.SetTexture(kErode, "_InHeightRT", height);
         erosionCS.SetTexture(kErode, "_StreamRT", stream);
         erosionCS.SetTexture(kErode, "_OutHeightRT", dst);
+        erosionCS.SetTexture(kErode, "_SnowRT", snow);
         DispatchFor(height, kErode);
     }
 
-    void ThermalOnce(RenderTexture height, RenderTexture dst, int level)
+    void ThermalOnce(RenderTexture height, RenderTexture snow, RenderTexture dst)
     {
         SetCommonUniforms(height);
         SetThermalUniforms();
-        SetMaterialUniforms(kThermal, level);
+        SetMaterialUniforms(kThermal);
 
         erosionCS.SetTexture(kThermal, "_InHeightRT", height);
         erosionCS.SetTexture(kThermal, "_TempRT", dst);
+        erosionCS.SetTexture(kThermal, "_SnowRT", snow);
         DispatchFor(height, kThermal);
     }
 
-    void DepositOnce(RenderTexture height, RenderTexture stream, RenderTexture sediment, RenderTexture dst, int level)
+    void DepositOnce(RenderTexture height, RenderTexture stream, RenderTexture sediment, RenderTexture snow, RenderTexture dst)
     {
         SetCommonUniforms(height);
         SetDepositionUniforms();
-        SetMaterialUniforms(kDeposit, level);
+        SetMaterialUniforms(kDeposit);
 
         erosionCS.SetTexture(kDeposit, "_InHeightRT", height);
         erosionCS.SetTexture(kDeposit, "_StreamRT", stream);
         erosionCS.SetTexture(kDeposit, "_SedimentRT", sediment);
         erosionCS.SetTexture(kDeposit, "_OutHeightRT", dst);
+        erosionCS.SetTexture(kDeposit, "_SnowRT", snow);
         DispatchFor(height, kDeposit);
     }
 
@@ -433,9 +448,6 @@ public class GpuTerrainPipeline : MonoBehaviour
 
     void SetErosionUniforms()
     {
-        erosionCS.SetFloat("_ErosionK", erosionK);
-        erosionCS.SetFloat("_ErosionPSA", erosionPSA);
-        erosionCS.SetFloat("_ErosionPSL", erosionPSL);
         erosionCS.SetFloat("_ErosionDT", erosionDT);
         erosionCS.SetFloat("_FlowP", flowP);
         erosionCS.SetFloat("_RainIntensity", rainIntensity);
@@ -454,21 +466,16 @@ public class GpuTerrainPipeline : MonoBehaviour
         erosionCS.SetFloat("_FlowP", flowP);
     }
 
-    void SetMaterialUniforms(int kernel, int level)
+    void SetMaterialUniforms(int kernel)
     {
-        Texture2D mat = null;
-
-        if (materialMaps != null && materialMaps.Length > 0)
-        {
-            int idx = Mathf.Min(level, materialMaps.Length - 1); // clamp
-            mat = materialMaps[idx];
-        }
+        Texture2D mat = materialMaps;
 
         if (mat != null)
         {
             erosionCS.SetTexture(kernel, "_MaterialTex", mat);
         }
 
+        erosionCS.SetVector("_Mat_rain", new Vector4(materialLUT.rain.x, materialLUT.rain.y, materialLUT.rain.z, 0f));
         erosionCS.SetVector("_Mat_n", new Vector4(materialLUT.n.x, materialLUT.n.y, materialLUT.n.z, 0f));
         erosionCS.SetVector("_Mat_m", new Vector4(materialLUT.m.x, materialLUT.m.y, materialLUT.m.z, 0f));
         erosionCS.SetVector("_Mat_kE", new Vector4(materialLUT.kE.x, materialLUT.kE.y, materialLUT.kE.z, 0f));

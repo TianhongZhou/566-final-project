@@ -16,11 +16,6 @@ public class GenerateBandMaterialMaps : MonoBehaviour
             return;
         }
 
-        if (pipeline.materialMaps == null || pipeline.materialMaps.Length == 0)
-        {
-            pipeline.materialMaps = new Texture2D[1];
-        }
-
         var tex = new Texture2D(width, height, TextureFormat.RGBA32, false, true);
         tex.wrapMode = TextureWrapMode.Clamp;
         tex.filterMode = FilterMode.Bilinear;
@@ -39,12 +34,12 @@ public class GenerateBandMaterialMaps : MonoBehaviour
                 else                 // right: snow
                     c = new Color(0, 0, 1, 1);
 
-                tex.SetPixel(x, y, c);
+                tex.SetPixel(x, y, new Color(0, 0, 1, 1));
             }
         }
         tex.Apply();
 
-        pipeline.materialMaps[0] = tex;
+        pipeline.materialMaps = tex;
         Debug.Log("Generated band material map for level 0");
     }
 }
