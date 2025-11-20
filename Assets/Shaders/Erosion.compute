@@ -240,26 +240,29 @@ float ComputeIncomingFlow(int2 p)
     return totalFlow;
 }
 
+float SmoothParam(float3 w, float3 p)
+{
+    float3 pSmooth = pow(p, 0.5); // soften response
+    float outSmooth = dot(w, pSmooth);
+    return outSmooth * outSmooth;
+}
+
 float3 SampleMaterialWeights(int2 p)
 {
-    // Assume same resolution as height for now
-    uint w, h;
-    _MaterialTex.GetDimensions(w, h);
+    
+    float2 uv = (float2(p) + 0.5) / float2((float)_Width, (float)_Height);
 
-    p.x = clamp(p.x, 0, (int) w - 1);
-    p.y = clamp(p.y, 0, (int) h - 1);
+    float4 rgba = _MaterialTex.SampleLevel(sampLinearClamp, uv, 0);
 
-    float4 rgba = _MaterialTex.Load(int3(p, 0));
-    float3 w3 = rgba.xyz;
-
+    float3 w3 = max(rgba.xyz, 0.0);
     float sum = w3.x + w3.y + w3.z;
+
     if (sum < 1e-6)
-    {
-        return float3(1.0, 0.0, 0.0);
-    }
+        return float3(1,0,0);
 
     return w3 / sum;
 }
+
 
 void GetMaterialParams(int2 p,
                        out float n, out float m, out float kE,
@@ -267,14 +270,56 @@ void GetMaterialParams(int2 p,
 {
     float3 w = SampleMaterialWeights(p);
 
-    n = dot(w, _Mat_n.xyz);
-    m = dot(w, _Mat_m.xyz);
-    kE = dot(w, _Mat_kE.xyz);
-    talusDeg = dot(w, _Mat_talusDeg.xyz);
-    kC = dot(w, _Mat_kC.xyz);
-    kD = dot(w, _Mat_kD.xyz);
-    rain = dot(w, _Mat_rain.xyz);
+   n        = SmoothParam(w, _Mat_n.xyz);
+m        = SmoothParam(w, _Mat_m.xyz);
+kE       = SmoothParam(w, _Mat_kE.xyz);
+kC       = SmoothParam(w, _Mat_kC.xyz);
+kD       = SmoothParam(w, _Mat_kD.xyz);
+talusDeg = dot(w, _Mat_talusDeg.xyz);  // keep linear
+rain     = dot(w, _Mat_rain.xyz);      // keep linear
 }
+
+float ComputeNeighborStreamAverage(int2 p)
+{
+    float sum = 0.0;
+    float count = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 q = p + next8[i];
+        if (!IsInBounds(q))
+            continue;
+
+        sum += GetStream(q);
+        count += 1.0;
+    }
+
+    return (count > 0.0) ? (sum / count) : GetStream(p);
+}
+
+float ComputeMaterialBlendFactor(int2 p)
+{
+    float3 wCenter = SampleMaterialWeights(p);
+
+    float maxDiff = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 q = p + next8[i];
+        if (!IsInBounds(q)) continue;
+
+        float3 wNeigh = SampleMaterialWeights(q);
+
+        float diff = length(wNeigh - wCenter);
+        maxDiff = max(maxDiff, diff);
+    }
+
+    // Convert material difference into a blend strength
+    return saturate(maxDiff * 3.0);   // 0 = no blend, 1 = full smoothing
+}
+
 
 float GetCombinedHeight(int2 p)
 {
@@ -308,6 +353,7 @@ void FlowRouting(uint3 id : SV_DispatchThreadID)
     if (!IsInBounds(pos))
         return;
 
+    // Material weights: rock / soil / snow
     float3 matW = SampleMaterialWeights(pos);
     float wRock = matW.x;
     float wSoil = matW.y;
@@ -315,43 +361,52 @@ void FlowRouting(uint3 id : SV_DispatchThreadID)
 
     float baseRain = _CellSize * _CellSize * _RainIntensity;
 
-    // ---- Snow: diffusion-like flow ----
-    if (wSnow > max(wRock, wSoil))
+    // Common values
+    float selfStream = GetStream(pos);
+    float incoming   = ComputeIncomingFlow(pos);
+
+
+    float sum = 0.0;
+    float cnt = 0.0;
+    [unroll]
+    for (int i = 0; i < 8; ++i)
     {
-        float self = GetStream(pos);
-        float sum = 0.0;
-        float cnt = 0.0;
-        [unroll]
-        for (int i = 0; i < 8; ++i)
-        {
-            int2 q = pos + next8[i];
-            if (!IsInBounds(q))
-                continue;
-            sum += GetStream(q);
-            cnt += 1.0;
-        }
-        float neighAvg = (cnt > 0.0) ? (sum / cnt) : self;
+        int2 q = pos + next8[i];
+        if (!IsInBounds(q))
+            continue;
 
-        float newStream = baseRain + lerp(self, neighAvg, 0.8) * 0.3 + ComputeIncomingFlow(pos) * 0.3;
-        _OutStreamRT[pos] = newStream;
-        return;
+        sum += GetStream(q);
+        cnt += 1.0;
     }
+    float neighAvg = (cnt > 0.0) ? (sum / cnt) : selfStream;
 
-    // ---- Soil: steepest dir flow ----
-    if (wSoil > wRock)
-    {
-        int2 d = GetSteepestNeighbor(pos);
-        int2 src = pos + d;
-        float upstream = GetStream(src);
-        float stream = baseRain + ComputeIncomingFlow(pos) - upstream * 5.0;
-        _OutStreamRT[pos] = stream;
-        return;
-    }
+    float snowStream =
+        baseRain +
+        lerp(selfStream, neighAvg, 0.8) * 0.3 +
+        incoming * 0.3;
 
-    // ---- Rock: weighted multi-direction routing ----
-    float streamRock = baseRain + ComputeIncomingFlow(pos);
-    _OutStreamRT[pos] = streamRock;
+    int2 d       = GetSteepestNeighbor(pos);
+    int2 src     = pos + d;
+    float upstream = GetStream(src);
+
+    float soilStream =
+        baseRain +
+        incoming -
+        upstream * 5.0;
+
+
+    float rockStream =
+        baseRain +
+        incoming;
+
+    float finalStream =
+          wRock * rockStream
+        + wSoil * soilStream
+        + wSnow * snowStream;
+
+    _OutStreamRT[pos] = finalStream;
 }
+
 
 [numthreads(8, 8, 1)]
 void ErosionStep(uint3 id : SV_DispatchThreadID)

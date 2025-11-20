@@ -34,7 +34,7 @@ public class GenerateBandMaterialMaps : MonoBehaviour
                 else                 // right: snow
                     c = new Color(0, 0, 1, 1);
 
-                tex.SetPixel(x, y, new Color(0, 0, 1, 1));
+                tex.SetPixel(x, y, c);
             }
         }
         tex.Apply();
