@@ -501,6 +501,11 @@ public class GpuTerrainPipeline : MonoBehaviour
 
         RenderTexture origin = heightRTs[0];
 
+        float referenceSize = 1024f;
+        float currentSize = (float)height.width;
+        float scaleFactor = referenceSize / currentSize;
+        erosionCS.SetFloat("_ResolutionScaleFactor", scaleFactor);
+
         int iterations = 12; 
         for (int i = 0; i < iterations; ++i)
         {
@@ -508,6 +513,7 @@ public class GpuTerrainPipeline : MonoBehaviour
             erosionCS.SetTexture(kPostProcess, "_OutHeightRT", height);
             erosionCS.SetTexture(kPostProcess, "_InLowResHeightRT", origin);
             erosionCS.SetInt("_ScaleSoil", i);
+
             DispatchFor(height, kPostProcess);
 
             var t = temp;
@@ -706,12 +712,12 @@ public class GpuTerrainPipeline : MonoBehaviour
         }
         var td = targetTerrain.terrainData;
 
-        int alphaRes = materialMaps.width; 
+        int alphaRes = materialMaps.width;
         td.alphamapResolution = alphaRes;
 
         int w = alphaRes;
         int h = alphaRes;
-        int numLayers = td.terrainLayers.Length; 
+        int numLayers = td.terrainLayers.Length;
         if (numLayers < 3)
         {
             SetupTerrainLayers();
@@ -720,6 +726,9 @@ public class GpuTerrainPipeline : MonoBehaviour
 
         float[,,] alphas = new float[h, w, numLayers];
 
+        int blurRadius = 2; 
+        float jitterStrength = 10.0f; 
+
         for (int y = 0; y < h; y++)
         {
             float v = (float)y / (h - 1);
@@ -727,7 +736,27 @@ public class GpuTerrainPipeline : MonoBehaviour
             {
                 float u = (float)x / (w - 1);
 
-                Color c = materialMaps.GetPixelBilinear(u, v);
+                float jx = (Hash01(x, y, 12345) - 0.5f) * jitterStrength / w;
+                float jy = (Hash01(x, y, 54321) - 0.5f) * jitterStrength / h;
+
+                float uj = Mathf.Clamp01(u + jx);
+                float vj = Mathf.Clamp01(v + jy);
+
+                Color accum = Color.black;
+                int count = 0;
+                for (int oy = -blurRadius; oy <= blurRadius; oy++)
+                {
+                    for (int ox = -blurRadius; ox <= blurRadius; ox++)
+                    {
+                        float nu = uj + ox / (float)(w - 1);
+                        float nv = vj + oy / (float)(h - 1);
+                        Color cSample = materialMaps.GetPixelBilinear(nu, nv);
+                        accum += cSample;
+                        count++;
+                    }
+                }
+                Color c = accum / Mathf.Max(1, count);
+
                 float r = c.r;
                 float g = c.g;
                 float b = c.b;
@@ -744,11 +773,19 @@ public class GpuTerrainPipeline : MonoBehaviour
 
                 alphas[y, x, 0] = r;
                 alphas[y, x, 1] = g;
-                alphas[y, x, 2] = b; 
+                alphas[y, x, 2] = b;
             }
         }
 
         td.SetAlphamaps(0, 0, alphas);
-        Debug.Log("Applied material map to terrain splatmap.");
+        Debug.Log("Applied material map to terrain splatmap (blur + jitter).");
+    }
+
+    static float Hash01(int x, int y, int seed)
+    {
+        int n = x * 73856093 ^ y * 19349663 ^ seed;
+        float s = Mathf.Sin(n * 0.0001f) * 43758.5453f;
+        s = s - Mathf.Floor(s);
+        return Mathf.Abs(s);
     }
 }
