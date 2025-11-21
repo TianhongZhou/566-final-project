@@ -5,10 +5,9 @@ using System.IO;
 using Unity.Collections;
 using System.Text;
 
+[ExecuteAlways]
 public class GpuTerrainPipeline : MonoBehaviour
 {
-    
-
     [Header("Terrain")]
     public Terrain targetTerrain;       
     public float terrainSizeXZ = 10000f;
@@ -71,6 +70,7 @@ public class GpuTerrainPipeline : MonoBehaviour
     int kRetarget;
     int kBreach;
     int kClear;
+    int kPostProcess;
 
     [System.Serializable]
     public struct LevelSchedule
@@ -131,14 +131,14 @@ public class GpuTerrainPipeline : MonoBehaviour
         }
     }
 
-
-    void Start()
+    [ContextMenu("Generate Terrain")]
+    void Generate()
+    //void Start()
     {
         if (!inputHeight) { Debug.LogError("Missing input height"); return; }
         if (!erosionCS) { Debug.LogError("Missing Erosion.compute"); return; }
         if (!targetTerrain) { Debug.LogError("Missing Terrain"); return; }
-
-        targetTerrain.terrainData = Instantiate(targetTerrain.terrainData);
+        ResetAllRTs();
 
         InitKernels();
         InitRenderTextures();
@@ -146,9 +146,15 @@ public class GpuTerrainPipeline : MonoBehaviour
         // Main algorithm
         RunMultiscalePipeline();
 
-        // Update Terrain
+        // Post Process
         int rt = Mathf.Max(0, levels.Length - 1);
+        ApplyPostProcess(heightRTs[rt]);
+
+        // Update Terrain
         UpdateTerrainFromRT(heightRTs[rt], targetTerrain, terrainSizeXZ, terrainMaxHeight);
+
+        SetupTerrainLayers();
+        ApplyMaterialMapToTerrain();
     }
 
     void InitKernels()
@@ -161,6 +167,7 @@ public class GpuTerrainPipeline : MonoBehaviour
         kDeposit = erosionCS.FindKernel("DepositStep");
         kRetarget = erosionCS.FindKernel("Retargeting");
         kBreach = erosionCS.FindKernel("Breaching");
+        kPostProcess = erosionCS.FindKernel("PostProcess");
     }
 
     RenderTexture CreateRT(int w, int h)
@@ -484,6 +491,33 @@ public class GpuTerrainPipeline : MonoBehaviour
         erosionCS.SetVector("_Mat_kD", new Vector4(materialLUT.kD.x, materialLUT.kD.y, materialLUT.kD.z, 0f));
     }
 
+    void ApplyPostProcess(RenderTexture height)
+    {
+        SetCommonUniforms(height);
+        SetMaterialUniforms(kPostProcess);
+
+        var temp = CreateRT(height.width, height.height);
+        Graphics.Blit(height, temp);
+
+        RenderTexture origin = heightRTs[0];
+
+        int iterations = 12; 
+        for (int i = 0; i < iterations; ++i)
+        {
+            erosionCS.SetTexture(kPostProcess, "_InHeightRT", temp);
+            erosionCS.SetTexture(kPostProcess, "_OutHeightRT", height);
+            erosionCS.SetTexture(kPostProcess, "_InLowResHeightRT", origin);
+            erosionCS.SetInt("_ScaleSoil", i);
+            DispatchFor(height, kPostProcess);
+
+            var t = temp;
+            temp = height;
+            height = t;
+        }
+
+        temp.Release();
+    }
+
     void DispatchFor(RenderTexture rt, int kernel)
     {
         int gx = (rt.width + 7) / 8;
@@ -569,7 +603,7 @@ public class GpuTerrainPipeline : MonoBehaviour
         File.WriteAllBytes(path, bytes);
 
         Debug.Log($"Saved height PNG to: {path}");
-        Destroy(tex);
+        //Destroy(tex);
     }
 
     void PrintRTValues(RenderTexture rt, string name = "RT", int sampleStep = 32)
@@ -622,5 +656,99 @@ public class GpuTerrainPipeline : MonoBehaviour
 
             Debug.Log(sb.ToString());
         });
+    }
+
+    void ResetAllRTs()
+    {
+        void ReleaseDict(Dictionary<int, RenderTexture> dict)
+        {
+            foreach (var kv in dict)
+            {
+                if (kv.Value != null)
+                    kv.Value.Release();
+            }
+            dict.Clear();
+        }
+
+        ReleaseDict(heightRTs);
+        ReleaseDict(streamRTs);
+        ReleaseDict(sedimentRTs);
+        ReleaseDict(tempRTs);
+        ReleaseDict(snowRTs);
+
+        if (_origHeightAtFinal != null)
+        {
+            _origHeightAtFinal.Release();
+            _origHeightAtFinal = null;
+        }
+    }
+
+    void SetupTerrainLayers()
+    {
+        var td = targetTerrain.terrainData;
+
+        var rockLayer = TerrainMaterialUtils.CreateSolidColorLayer(
+            new Color(0.5f, 0.5f, 0.5f), "Rock");
+        var soilLayer = TerrainMaterialUtils.CreateSolidColorLayer(
+            new Color(0.6f, 0.45f, 0.2f), "Soil");    
+        var snowLayer = TerrainMaterialUtils.CreateSolidColorLayer(
+            new Color(0.95f, 0.95f, 0.95f), "Snow"); 
+
+        td.terrainLayers = new TerrainLayer[] { rockLayer, soilLayer, snowLayer };
+    }
+
+    void ApplyMaterialMapToTerrain()
+    {
+        if (materialMaps == null)
+        {
+            Debug.LogError("materialMaps is null");
+            return;
+        }
+        var td = targetTerrain.terrainData;
+
+        int alphaRes = materialMaps.width; 
+        td.alphamapResolution = alphaRes;
+
+        int w = alphaRes;
+        int h = alphaRes;
+        int numLayers = td.terrainLayers.Length; 
+        if (numLayers < 3)
+        {
+            SetupTerrainLayers();
+            numLayers = td.terrainLayers.Length;
+        }
+
+        float[,,] alphas = new float[h, w, numLayers];
+
+        for (int y = 0; y < h; y++)
+        {
+            float v = (float)y / (h - 1);
+            for (int x = 0; x < w; x++)
+            {
+                float u = (float)x / (w - 1);
+
+                Color c = materialMaps.GetPixelBilinear(u, v);
+                float r = c.r;
+                float g = c.g;
+                float b = c.b;
+
+                float sum = r + g + b;
+                if (sum < 1e-6f)
+                {
+                    r = 1; g = 0; b = 0; sum = 1;
+                }
+
+                r /= sum;
+                g /= sum;
+                b /= sum;
+
+                alphas[y, x, 0] = r;
+                alphas[y, x, 1] = g;
+                alphas[y, x, 2] = b; 
+            }
+        }
+
+        td.SetAlphamaps(0, 0, alphas);
+        Debug.Log("Applied material map to terrain splatmap.");
     }
 }

@@ -8,6 +8,7 @@
 #pragma kernel Retargeting
 #pragma kernel Breaching
 #pragma kernel ClearRT
+#pragma kernel PostProcess
 
 // Create a RenderTexture with enableRandomWrite flag and set it
 // with cs.SetTexture
@@ -27,6 +28,7 @@ RWTexture2D<float> _RTToClear;
 Texture2D<float> _OrigHeightRT;
 RWTexture2D<float> _SnowRT;
 Texture2D<float4> _MaterialTex; // R=rock, G=soil, B=snow, A unused
+Texture2D<float4> _InLowResHeightRT;
 
 // Per-material LUTs; xyz are used, w ignored
 uniform float4 _Mat_n; // slope exponent n   (rock, soil, snow)
@@ -67,6 +69,7 @@ int _BreachIters;
 float _CarveEps;
 int _Radius;
 int _BlurPass;
+int _ScaleSoil;
 
 SamplerState sampLinearClamp
 {
@@ -240,13 +243,6 @@ float ComputeIncomingFlow(int2 p)
     return totalFlow;
 }
 
-float SmoothParam(float3 w, float3 p)
-{
-    float3 pSmooth = pow(p, 0.5); // soften response
-    float outSmooth = dot(w, pSmooth);
-    return outSmooth * outSmooth;
-}
-
 float3 SampleMaterialWeights(int2 p)
 {
     
@@ -270,56 +266,14 @@ void GetMaterialParams(int2 p,
 {
     float3 w = SampleMaterialWeights(p);
 
-   n        = SmoothParam(w, _Mat_n.xyz);
-m        = SmoothParam(w, _Mat_m.xyz);
-kE       = SmoothParam(w, _Mat_kE.xyz);
-kC       = SmoothParam(w, _Mat_kC.xyz);
-kD       = SmoothParam(w, _Mat_kD.xyz);
-talusDeg = dot(w, _Mat_talusDeg.xyz);  // keep linear
-rain     = dot(w, _Mat_rain.xyz);      // keep linear
+    n = dot(w, _Mat_n.xyz);
+    m = dot(w, _Mat_m.xyz);
+    kE = dot(w, _Mat_kE.xyz);
+    talusDeg = dot(w, _Mat_talusDeg.xyz);
+    kC = dot(w, _Mat_kC.xyz);
+    kD = dot(w, _Mat_kD.xyz);
+    rain = dot(w, _Mat_rain.xyz);
 }
-
-float ComputeNeighborStreamAverage(int2 p)
-{
-    float sum = 0.0;
-    float count = 0.0;
-
-    [unroll]
-    for (int i = 0; i < 8; i++)
-    {
-        int2 q = p + next8[i];
-        if (!IsInBounds(q))
-            continue;
-
-        sum += GetStream(q);
-        count += 1.0;
-    }
-
-    return (count > 0.0) ? (sum / count) : GetStream(p);
-}
-
-float ComputeMaterialBlendFactor(int2 p)
-{
-    float3 wCenter = SampleMaterialWeights(p);
-
-    float maxDiff = 0.0;
-
-    [unroll]
-    for (int i = 0; i < 8; i++)
-    {
-        int2 q = p + next8[i];
-        if (!IsInBounds(q)) continue;
-
-        float3 wNeigh = SampleMaterialWeights(q);
-
-        float diff = length(wNeigh - wCenter);
-        maxDiff = max(maxDiff, diff);
-    }
-
-    // Convert material difference into a blend strength
-    return saturate(maxDiff * 3.0);   // 0 = no blend, 1 = full smoothing
-}
-
 
 float GetCombinedHeight(int2 p)
 {
@@ -361,50 +315,41 @@ void FlowRouting(uint3 id : SV_DispatchThreadID)
 
     float baseRain = _CellSize * _CellSize * _RainIntensity;
 
-    // Common values
-    float selfStream = GetStream(pos);
-    float incoming   = ComputeIncomingFlow(pos);
-
-
-    float sum = 0.0;
-    float cnt = 0.0;
-    [unroll]
-    for (int i = 0; i < 8; ++i)
+    // ---- Snow: diffusion-like flow ----
+    if (wSnow > max(wRock, wSoil))
     {
-        int2 q = pos + next8[i];
-        if (!IsInBounds(q))
-            continue;
-
-        sum += GetStream(q);
-        cnt += 1.0;
+        float self = GetStream(pos);
+        float sum = 0.0;
+        float cnt = 0.0;
+        [unroll]
+        for (int i = 0; i < 8; ++i)
+        {
+            int2 q = pos + next8[i];
+            if (!IsInBounds(q))
+                continue;
+            sum += GetStream(q);
+            cnt += 1.0;
+        }
+        float neighAvg = (cnt > 0.0) ? (sum / cnt) : self;
+        float newStream = baseRain + lerp(self, neighAvg, 0.8) * 0.3 + ComputeIncomingFlow(pos) * 0.3;
+        _OutStreamRT[pos] = newStream;
+        return;
     }
-    float neighAvg = (cnt > 0.0) ? (sum / cnt) : selfStream;
 
-    float snowStream =
-        baseRain +
-        lerp(selfStream, neighAvg, 0.8) * 0.3 +
-        incoming * 0.3;
-
-    int2 d       = GetSteepestNeighbor(pos);
-    int2 src     = pos + d;
-    float upstream = GetStream(src);
-
-    float soilStream =
-        baseRain +
-        incoming -
-        upstream * 5.0;
-
-
-    float rockStream =
-        baseRain +
-        incoming;
-
-    float finalStream =
-          wRock * rockStream
-        + wSoil * soilStream
-        + wSnow * snowStream;
-
-    _OutStreamRT[pos] = finalStream;
+    // ---- Soil: steepest dir flow ----
+    if (wSoil > wRock)
+    {
+        int2 d = GetSteepestNeighbor(pos);
+        int2 src = pos + d;
+        float upstream = GetStream(src);
+        float stream = baseRain + ComputeIncomingFlow(pos) - upstream * 5.0;
+        _OutStreamRT[pos] = stream;
+        return;
+    }
+    
+    // ---- Rock: weighted multi-direction routing ----
+    float streamRock = baseRain + ComputeIncomingFlow(pos);
+    _OutStreamRT[pos] = streamRock;
 }
 
 
@@ -445,7 +390,7 @@ void ErosionStep(uint3 id : SV_DispatchThreadID)
         float meltRate = kE * pow(max(stream, 0.0), m) * _ErosionDT; // melt model
         meltRate = min(meltRate, snow);
 
-        snow -= meltRate;
+        snow -= meltRate * 1.2;
         baseH += meltRate + streamPower;
 
         float newCombined = baseH + snow;
@@ -840,4 +785,37 @@ void ClearRT(uint3 id : SV_DispatchThreadID)
     if (pos.x >= _Width || pos.y >= _Height)
         return;
     _RTToClear[pos] = 0.0;
+}
+
+int GetDominantMaterial(float3 w)
+{
+    if (w.x >= w.y && w.x >= w.z)
+        return 0;
+    if (w.y >= w.z)
+        return 1; 
+    return 2;
+}
+
+[numthreads(8, 8, 1)]
+void PostProcess(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (p.x >= (int) _Width || p.y >= (int) _Height)
+        return;
+    
+    float hOriginalRaw = _InHeightRT[p];
+    float3 wCenter = SampleMaterialWeights(p);
+
+    float w_soil = wCenter.y;
+    float k_soil = (_ScaleSoil == 0) ? 1.1 : 1.0;
+    float soilScale = lerp(1.0, k_soil, w_soil);
+
+    float w_snow = wCenter.z;
+    float k_snow = (_ScaleSoil == 0) ? 0.9 : 1.0;
+    float snowScale = lerp(1.0, k_snow, w_snow);
+
+    float combinedScale = soilScale * snowScale;
+    float hCenterScaled = hOriginalRaw * combinedScale;
+    
+    _OutHeightRT[p] = saturate(hCenterScaled);
 }
