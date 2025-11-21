@@ -70,6 +70,7 @@ float _CarveEps;
 int _Radius;
 int _BlurPass;
 int _ScaleSoil;
+float _ResolutionScaleFactor;
 
 SamplerState sampLinearClamp
 {
@@ -390,8 +391,8 @@ void ErosionStep(uint3 id : SV_DispatchThreadID)
         float meltRate = kE * pow(max(stream, 0.0), m) * _ErosionDT; // melt model
         meltRate = min(meltRate, snow);
 
-        snow -= meltRate * 1.2;
-        baseH += meltRate + streamPower;
+        snow -= meltRate;
+        baseH += meltRate - streamPower;
 
         float newCombined = baseH + snow;
         _SnowRT[pos] = snow;
@@ -803,19 +804,90 @@ void PostProcess(uint3 id : SV_DispatchThreadID)
     if (p.x >= (int) _Width || p.y >= (int) _Height)
         return;
     
+    int BASE_RADIUS = 5;
+    float MAX_SIGMA_RATIO = (float) BASE_RADIUS / 2.0;
+    
+    int currentMaxRadius = (int) ceil((float) BASE_RADIUS / _ResolutionScaleFactor);
+    currentMaxRadius = max(1, currentMaxRadius);
+    
+    float maxSigmaBase = (float) BASE_RADIUS / MAX_SIGMA_RATIO;
+    float maxSigma = max(0.1, maxSigmaBase / _ResolutionScaleFactor);
+    
     float hOriginalRaw = _InHeightRT[p];
     float3 wCenter = SampleMaterialWeights(p);
-
+    
+    float w_rock = wCenter.x;
+    float k_rock = (_ScaleSoil == 0) ? 0.84 : 1.0;
+    float rockScale = lerp(1.0, k_rock, w_rock);
+    
     float w_soil = wCenter.y;
-    float k_soil = (_ScaleSoil == 0) ? 1.1 : 1.0;
+    float k_soil = (_ScaleSoil == 0) ? 0.95 : 1.0;
     float soilScale = lerp(1.0, k_soil, w_soil);
-
+    
     float w_snow = wCenter.z;
-    float k_snow = (_ScaleSoil == 0) ? 0.9 : 1.0;
+    float k_snow = (_ScaleSoil == 0) ? 1.0 : 1.0;
     float snowScale = lerp(1.0, k_snow, w_snow);
 
-    float combinedScale = soilScale * snowScale;
+    float combinedScale = rockScale * soilScale * snowScale;
     float hCenterScaled = hOriginalRaw * combinedScale;
     
-    _OutHeightRT[p] = saturate(hCenterScaled);
+    int probeDist = currentMaxRadius;
+    float totalDiff = 0;
+    
+    int2 offsets[4] = { int2(probeDist, 0), int2(-probeDist, 0), int2(0, probeDist), int2(0, -probeDist) };
+    
+    for (int k = 0; k < 4; k++)
+    {
+        int2 probePos = clamp(p + offsets[k], int2(0, 0), int2(_Width - 1, _Height - 1));
+        float3 wProbe = SampleMaterialWeights(probePos);
+        totalDiff += distance(wCenter, wProbe);
+    }
+    
+    float edgeIntensity = saturate(totalDiff * 2.0);
+    
+    edgeIntensity = smoothstep(0.05, 1.0, edgeIntensity);
+    
+    float minSigma = 0.15; 
+    
+    float currentSigma = lerp(minSigma, maxSigma, edgeIntensity);
+    
+    if (currentSigma < 0.2)
+    {
+        _OutHeightRT[p] = saturate(hCenterScaled);
+        return;
+    }
+
+    float twoSigmaSq = 2.0 * currentSigma * currentSigma;
+
+    int radius = currentMaxRadius;
+    
+    float hSum = 0;
+    float weightSum = 0;
+    
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            float distSq = float(x * x + y * y);
+            
+            float weight = exp(-distSq / twoSigmaSq);
+            
+            int2 neighborPos = clamp(p + int2(x, y), int2(0, 0), int2(_Width - 1, _Height - 1));
+            
+            float hNeighborRaw = _InHeightRT[neighborPos];
+            float3 wNeighbor = SampleMaterialWeights(neighborPos);
+            
+            float n_rockScale = lerp(1.0, k_rock, wNeighbor.x);
+            float n_soilScale = lerp(1.0, k_soil, wNeighbor.y);
+            float n_snowScale = lerp(1.0, k_snow, wNeighbor.z);
+            float hNeighborScaled = hNeighborRaw * n_rockScale * n_soilScale * n_snowScale;
+            
+            hSum += hNeighborScaled * weight;
+            weightSum += weight;
+        }
+    }
+
+    float hFinal = hSum / weightSum;
+    
+    _OutHeightRT[p] = saturate(hFinal);
 }
