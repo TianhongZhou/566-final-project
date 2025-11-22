@@ -703,7 +703,7 @@ public class GpuTerrainPipeline : MonoBehaviour
         td.terrainLayers = new TerrainLayer[] { rockLayer, soilLayer, snowLayer };
     }
 
-    void ApplyMaterialMapToTerrain()
+    public void ApplyMaterialMapToTerrain()
     {
         if (materialMaps == null)
         {
@@ -717,12 +717,8 @@ public class GpuTerrainPipeline : MonoBehaviour
 
         int w = alphaRes;
         int h = alphaRes;
+        SetupTerrainLayers();
         int numLayers = td.terrainLayers.Length;
-        if (numLayers < 3)
-        {
-            SetupTerrainLayers();
-            numLayers = td.terrainLayers.Length;
-        }
 
         float[,,] alphas = new float[h, w, numLayers];
 
