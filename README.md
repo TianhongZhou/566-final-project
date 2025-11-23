@@ -2,19 +2,9 @@
 
 Team members: Zixiao Wang, Tianhong Zhou
 
-## Milestone #1
 
-### Progress
 
-We've successfully implemented and reproduced the multi-scale hydraulic erosion algorithm described in the original paper. The core compute-shader stages, including Flow Routing, Erosion, Thermal Relaxation, Deposition, Retargeting, and Breaching, are now functional in Unity and produce results consistent with the reference implementation. We have also confirmed the correctness of our pipeline scheduling (upsampling, buffer swapping, and multi-level execution). The terrain evolution behaves as expected under controlled test parameters, and we can visualize intermediate heightmaps directly through Unity's GPU readback for debugging and validation.
 
-### Results
-
-Comparison between base height map (256 * 256) and generated height map (2048 * 2048)
-
-![](img/m1_result.png)
-
-![](img/m1_resultTexture.png)
 
 ## Design Doc
 
@@ -86,3 +76,79 @@ Material-aware extensions (beyond paper)
 - Week4: Final polish
   - Zixiao Wang: Parameter tuning per level; stability checks; small UX touches (tooltips, reset buttons).
   - Tianhong Zhou: Visual polish: normals/splat export, look presets, camera paths; tidy overlays (flow dirs).
+
+## Milestone #1
+
+### Progress
+
+We've successfully implemented and reproduced the multi-scale hydraulic erosion algorithm described in the original paper. The core compute-shader stages, including Flow Routing, Erosion, Thermal Relaxation, Deposition, Retargeting, and Breaching, are now functional in Unity and produce results consistent with the reference implementation. We have also confirmed the correctness of our pipeline scheduling (upsampling, buffer swapping, and multi-level execution). The terrain evolution behaves as expected under controlled test parameters, and we can visualize intermediate heightmaps directly through Unity's GPU readback for debugging and validation.
+
+### Results
+
+Comparison between base height map (256 * 256) and generated height map (2048 * 2048)
+
+![](img/m1_result.png)
+
+![](img/m1_resultTexture.png)
+
+## Milestone #2
+
+### Progress
+
+For Milestone #2, we focused on extending the baseline multi-scale erosion system into a material-aware terrain simulation framework, enabling heterogeneous geological behavior. This required several non-trivial additions across the pipeline, including a new material authoring tool and parameter blending logic inside the compute kernels.
+
+
+We introduced a dedicated Material Map that lets artists paint or procedurally assign terrain types (ROCK / SOIL / SNOW).
+
+In summary, We have successfully implemented all the goals of our project.
+
+
+#### Key contributions:
+
+  - A custom editor utility for generating, loading, and visualizing material maps.
+
+  - Texture-based storage (R=rock, G=soil, B=snow) with normalized barycentric weights.
+
+  - Material map now scales to multi-level terrain erosion resolution (256 → 2048) using UV sampling inside compute shaders.
+
+  - Dynamic Guassian Blur on boundary for different materials to smooth out the visual artifacts and make it more natural like behavior.
+
+This system enables fine-grained control over geological composition and allows local erosion behavior to differ radically while storing only a lightweight texture.
+
+### Material-Aware
+The flow-routing stage switches behavior based on dominant material:
+ - Snow: diffusion-like flow (smooth spreading & melt behavior)
+ - Soil: steepest-descent directional routing
+ - Rock: weighted multi-direction flow (paper default)
+
+Erosion uses blended material parameters (n, m, kE), producing distinct geomorphology per material:
+  - Rock: slow incision, resistant cliffs
+ - Soil: aggressive channel carving
+ - Snow/Ice: melt + soft erosion
+
+Thermal erosion also branches by material:
+ - Rock: unchanged (steep stable slopes)
+ - Snow: avalanche-like smoothing (wide diffusion kernel)
+ - Soil: talus-angle-based mass wasting
+
+For Deposition kernel, Material affects sediment transport capacity and deposition:
+ - Rock: removes sediment (impermeable)
+  - Soil: deposits efficiently, builds alluvial fans
+ - Snow: deposits into snowpack, thickening drifts
+
+### Results
+
+
+#### All Rock
+![](img/allrock.png)
+
+
+#### Rock & Soil
+![](img/rocksoil.png)
+
+#### Rock, Soil, & Snow
+![](img/rocksoilsnow.png)
+
+#### Material map editor/brush
+
+![](img/m2.gif)
