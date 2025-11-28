@@ -6,6 +6,10 @@ University of Pennsylvania
 
 
 
+https://github.com/user-attachments/assets/8bb79ff4-cc33-4a12-ab28-be4d359beee9
+
+
+
 ### Overview
 High-resolution, hydrologically consistent terrains are expensive to author by hand and slow to simulate at full resolution. [Terrain Amplification using Multi-scale Erosion](https://hal.science/hal-04565030/document) (SIGGRAPH 2024) proposes a fast pipeline that amplifies a coarse DEM into a detailed terrain across scales while keeping drainage networks realistic. This project implements a fully GPU-accelerated reproduction of the amplification algorithm and extends it with material-aware erosion, real-time material painting, and full Unity Terrain integration.
 
