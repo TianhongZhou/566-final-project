@@ -6,7 +6,6 @@ University of Pennsylvania
 
 
 
-https://github.com/user-attachments/assets/8bb79ff4-cc33-4a12-ab28-be4d359beee9
 
 
 
@@ -21,6 +20,8 @@ We implemented all major algorithmic components as GPU compute kernels, coordina
 
 ![](img/ref.png)
 
+
+https://github.com/user-attachments/assets/8bb79ff4-cc33-4a12-ab28-be4d359beee9
 
 ### Project Structure
 ```
