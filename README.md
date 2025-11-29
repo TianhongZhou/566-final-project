@@ -18,7 +18,7 @@ T_{k+1} = D_k ∘ T_k ∘ E_k ∘ U_k (T_k)
 ```
 We implemented all major algorithmic components as GPU compute kernels, coordinated by a multiscale pipeline controller.
 
-![](img/ref.png)
+![](img/multi_scale.png)
 
 
 https://github.com/user-attachments/assets/8bb79ff4-cc33-4a12-ab28-be4d359beee9
@@ -173,6 +173,7 @@ Then later, the parameters/coefficients influence how kernel running:
 
 ### Example pictures
 
+![](img/mat.png)
 
 #### All Rock
 ![](img/allrock.png)
